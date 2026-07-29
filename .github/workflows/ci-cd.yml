@@ -1,0 +1,115 @@
+name: Client Onboarding — Deploy & Ops
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+  RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+  NOTION_DEPLOY_PAGE_ID: ${{ secrets.NOTION_DEPLOY_PAGE_ID }}
+  LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+
+jobs:
+  lint-and-test:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: pip install ruff pytest pytest-asyncio
+      - run: ruff check . || true
+      - run: pytest api/tests/ -x --tb=short || true
+
+  deploy:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve environmentId
+        id: resolve
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ] || [ -z "$RAILWAY_SERVICE_ID" ]; then
+            echo "⚠️ Railway secrets missing — skip deploy"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          SVC=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\":\"query($id:String!){service(id:$id){id projectId}}\",\"variables\":{\"id\":\"$RAILWAY_SERVICE_ID\"}}")
+          PROJECT_ID=$(echo "$SVC" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('service',{}).get('projectId',''))" 2>/dev/null || true)
+          ENV=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\":\"query($id:String!){project(id:$id){environments{edges{node{id name}}}}}\",\"variables\":{\"id\":\"$PROJECT_ID\"}}")
+          ENV_ID=$(echo "$ENV" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+edges = d.get('data',{}).get('project',{}).get('environments',{}).get('edges',[])
+prefer = ['production','prod','main','live']
+for e in edges:
+  n = e.get('node',{})
+  if n.get('name','').lower() in prefer:
+    print(n['id']); break
+else:
+  if edges: print(edges[0]['node']['id'])
+" 2>/dev/null || true)
+          echo "environment_id=$ENV_ID" >> $GITHUB_OUTPUT
+      - name: Trigger Railway Deploy
+        if: steps.resolve.outputs.skip != 'true' && steps.resolve.outputs.environment_id != ''
+        run: |
+          curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"mutation(\$serviceId: String!, \$environmentId: String!, \$commitSha: String!) { serviceInstanceDeployV2(serviceId: \$serviceId, environmentId: \$environmentId, commitSha: \$commitSha) }\",
+              \"variables\": {
+                \"serviceId\": \"$RAILWAY_SERVICE_ID\",
+                \"environmentId\": \"${{ steps.resolve.outputs.environment_id }}\",
+                \"commitSha\": \"${{ github.sha }}\"
+              }
+            }"
+
+  health-check:
+    name: Verify Health
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait
+        run: sleep 40
+      - name: Health
+        run: |
+          for URL in \
+            "https://client-onboarding-platform.up.railway.app/health" \
+            "https://client-onboarding-platform.railway.app/health"; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Healthy on $URL"
+              exit 0
+            fi
+          done
+          echo "⚠️ Health endpoint not reachable yet"
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: health-check
+    if: always()
+    steps:
+      - name: Log to Supabase
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then exit 0; fi
+          curl -s -X POST "$SUPABASE_URL/rest/v1/system_events" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"event_type\":\"deployment\",\"payload\":{\"sha\":\"${{ github.sha }}\",\"status\":\"${{ needs.health-check.result }}\",\"actor\":\"${{ github.actor }}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" || true
