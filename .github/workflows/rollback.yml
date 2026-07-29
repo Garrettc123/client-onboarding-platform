@@ -1,0 +1,81 @@
+name: Railway Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Rollback mode'
+        required: true
+        type: choice
+        options: [commit-sha, deployment-id]
+        default: commit-sha
+      sha:
+        description: 'Git commit SHA'
+        required: false
+      deployment_id:
+        description: 'Railway deployment ID'
+        required: false
+
+env:
+  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+  RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "commit-sha" ] && [ -z "${{ github.event.inputs.sha }}" ]; then exit 1; fi
+          if [ "${{ github.event.inputs.mode }}" = "deployment-id" ] && [ -z "${{ github.event.inputs.deployment_id }}" ]; then exit 1; fi
+          if [ -z "$RAILWAY_TOKEN" ] || [ -z "$RAILWAY_SERVICE_ID" ]; then exit 1; fi
+
+      - name: Resolve environmentId
+        id: resolve
+        if: github.event.inputs.mode == 'commit-sha'
+        run: |
+          SVC=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\":\"query($id:String!){service(id:$id){projectId}}\",\"variables\":{\"id\":\"$RAILWAY_SERVICE_ID\"}}")
+          PROJECT_ID=$(echo "$SVC" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('service',{}).get('projectId',''))")
+          ENV=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\":\"query($id:String!){project(id:$id){environments{edges{node{id name}}}}}\",\"variables\":{\"id\":\"$PROJECT_ID\"}}")
+          ENV_ID=$(echo "$ENV" | python3 -c "
+import sys,json
+edges=json.load(sys.stdin).get('data',{}).get('project',{}).get('environments',{}).get('edges',[])
+prefer=['production','prod','main','live']
+for e in edges:
+  if e['node']['name'].lower() in prefer: print(e['node']['id']); break
+else:
+  print(edges[0]['node']['id'] if edges else '')
+")
+          echo "environment_id=$ENV_ID" >> $GITHUB_OUTPUT
+
+      - name: Deploy SHA
+        if: github.event.inputs.mode == 'commit-sha'
+        run: |
+          curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"mutation(\$s:String!,\$e:String!,\$c:String!){serviceInstanceDeployV2(serviceId:\$s,environmentId:\$e,commitSha:\$c)}\",
+              \"variables\": {
+                \"s\": \"$RAILWAY_SERVICE_ID\",
+                \"e\": \"${{ steps.resolve.outputs.environment_id }}\",
+                \"c\": \"${{ github.event.inputs.sha }}\"
+              }
+            }"
+
+      - name: Deployment rollback
+        if: github.event.inputs.mode == 'deployment-id'
+        run: |
+          curl -s -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"query\": \"mutation(\$id:String!){deploymentRollback(id:\$id){id}}\",
+              \"variables\": {\"id\": \"${{ github.event.inputs.deployment_id }}\"}
+            }"
